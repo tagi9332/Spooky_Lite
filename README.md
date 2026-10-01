@@ -15,7 +15,7 @@ Paste in a NotScare.Me movie URL, and Spooky Lite will load the movie's jump-sca
 - Distinguish between major and minor scares
 - Display the movie poster
 - Interactive movie timeline
-- Start and pause the companion timer
+- Start and pause the companion timer (green **Start** when stopped, blue **Pause** while running)
 - Jump backward 15 seconds
 - Jump forward 15 seconds
 - Click the timeline to seek
@@ -23,6 +23,7 @@ Paste in a NotScare.Me movie URL, and Spooky Lite will load the movie's jump-sca
 - Adjustable warning lead time
 - Full-window jump-scare countdown overlay
 - Friendly audio alerts
+- Automatically lowers the Windows master volume around each scare
 - Dark interface designed to stay unobtrusive during movies
 - Native dark Windows title bar
 
@@ -121,6 +122,25 @@ By default:
 You can enter a different value in the **Warn me** field.
 
 The jump-scare warning times in the table will update automatically.
+
+---
+
+## Automatic Volume Lowering (Windows)
+
+When a warning starts, Spooky Lite lowers the Windows master volume and keeps it low until shortly after the scare.
+
+By default:
+
+```text
+Volume drops to 5% at the warning (30 seconds before)
+Volume is restored 30 seconds after the scare
+```
+
+Both values can be changed in the **Volume to ___ % until ___ seconds after** fields. Set the percentage to `100` to turn this off.
+
+- The warning chime plays at full volume first, then the volume drops.
+- If you change the volume yourself during a warning, Spooky Lite keeps your setting instead of restoring the old one.
+- The volume is also restored when you seek away, restart, load a new movie, or close the app.
 
 ---
 

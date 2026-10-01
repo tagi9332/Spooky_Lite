@@ -1,8 +1,10 @@
+import ctypes
 import io
 import re
 import sys
 import time
 import threading
+import uuid
 import tkinter as tk
 from tkinter import ttk, messagebox
 from urllib.parse import urlparse
@@ -26,12 +28,31 @@ DEFAULT_RUNTIME = 2 * 60 * 60
 DEFAULT_WARNING_SECONDS = 30
 MIN_WARNING_SECONDS = 1
 MAX_WARNING_SECONDS = 600
+DEFAULT_DUCK_PERCENT = 5
+DEFAULT_RESTORE_SECONDS = 30
+MAX_RESTORE_SECONDS = 600
+
+# Chime note patterns as (frequency Hz, duration ms).
+# Minor = short rising "ding-ding", Major = slightly longer happy arpeggio.
+CHIME_NOTE_GAP = 0.055
+CHIME_MINOR = [
+    (523, 140),   # C5
+    (659, 140),   # E5
+    (784, 160),   # G5
+    (1047, 260),  # C6
+]
+CHIME_MAJOR = CHIME_MINOR + [
+    (784, 160),   # G5
+    (659, 140),   # E5
+    (523, 140),   # C5
+]
 
 # Modern dark palette
 BG = "#131414"
 PANEL = "#232425"
 PANEL_2 = "#252525"
 BORDER = "#25314a"
+SETTINGS_BORDER = "#34405a"
 TEXT = "#edf2ff"
 MUTED = "#9aa9c2"
 ACCENT = "#416fb4"
@@ -39,6 +60,7 @@ ACCENT_HOVER = "#6887b4"
 MAJOR = "#ff5d73"
 MINOR = "#ffb454"
 SUCCESS = "#55d6a6"
+SUCCESS_HOVER = "#7fe3bd"
 TRACK = "#33405b"
 
 
@@ -233,6 +255,94 @@ def enable_windows_dark_title_bar(window):
         # The app should still run normally if the Windows API call is unavailable.
         pass
 
+
+class WindowsMasterVolume:
+    """Tiny ctypes wrapper around the Windows Core Audio master volume.
+
+    Avoids extra dependencies (pycaw/comtypes). Each call looks up the current
+    default output device, so switching to headphones mid-movie still works.
+    Call from the Tk main thread only (COM is initialized there).
+    """
+
+    CLSID_MMDEVICE_ENUMERATOR = "BCDE0395-E52F-467C-8E3D-C4579291692E"
+    IID_IMMDEVICE_ENUMERATOR = "A95664D2-9614-4F35-A746-DE8DB63617E6"
+    IID_IAUDIO_ENDPOINT_VOLUME = "5CDF2C82-841E-4546-9722-0CF74078229A"
+    CLSCTX_ALL = 23
+    COINIT_APARTMENTTHREADED = 2
+
+    def __init__(self):
+        if not sys.platform.startswith("win"):
+            raise OSError("System volume control is only supported on Windows.")
+        # S_FALSE / RPC_E_CHANGED_MODE just mean COM is already initialized here.
+        ctypes.windll.ole32.CoInitializeEx(None, self.COINIT_APARTMENTTHREADED)
+        self.get()  # Fail early if there is no usable output device.
+
+    @staticmethod
+    def _guid(text):
+        return (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(text).bytes_le)
+
+    @staticmethod
+    def _method(obj, index, restype, *argtypes):
+        vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+        func = ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(vtable[index])
+        return lambda *args: func(obj, *args)
+
+    def _with_endpoint(self, action):
+        enumerator = ctypes.c_void_p()
+        device = ctypes.c_void_p()
+        endpoint = ctypes.c_void_p()
+        try:
+            hr = ctypes.windll.ole32.CoCreateInstance(
+                ctypes.byref(self._guid(self.CLSID_MMDEVICE_ENUMERATOR)),
+                None,
+                self.CLSCTX_ALL,
+                ctypes.byref(self._guid(self.IID_IMMDEVICE_ENUMERATOR)),
+                ctypes.byref(enumerator),
+            )
+            if hr < 0:
+                raise OSError(f"CoCreateInstance failed (0x{hr & 0xFFFFFFFF:08X})")
+
+            # IMMDeviceEnumerator::GetDefaultAudioEndpoint(eRender, eConsole, &device)
+            self._method(enumerator, 4, ctypes.HRESULT, ctypes.c_int, ctypes.c_int,
+                         ctypes.POINTER(ctypes.c_void_p))(0, 0, ctypes.byref(device))
+
+            # IMMDevice::Activate(IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, &endpoint)
+            self._method(device, 3, ctypes.HRESULT, ctypes.c_void_p, ctypes.c_ulong,
+                         ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p))(
+                ctypes.byref(self._guid(self.IID_IAUDIO_ENDPOINT_VOLUME)),
+                self.CLSCTX_ALL,
+                None,
+                ctypes.byref(endpoint),
+            )
+            return action(endpoint)
+        finally:
+            for obj in (endpoint, device, enumerator):
+                if obj:
+                    self._method(obj, 2, ctypes.c_ulong)()  # IUnknown::Release
+
+    def get(self):
+        """Return the master volume as a 0.0-1.0 scalar."""
+        def action(endpoint):
+            level = ctypes.c_float()
+            # IAudioEndpointVolume::GetMasterVolumeLevelScalar
+            self._method(endpoint, 9, ctypes.HRESULT, ctypes.POINTER(ctypes.c_float))(
+                ctypes.byref(level)
+            )
+            return level.value
+
+        return self._with_endpoint(action)
+
+    def set(self, level):
+        """Set the master volume from a 0.0-1.0 scalar."""
+        level = max(0.0, min(1.0, float(level)))
+        # IAudioEndpointVolume::SetMasterVolumeLevelScalar
+        self._with_endpoint(
+            lambda endpoint: self._method(
+                endpoint, 7, ctypes.HRESULT, ctypes.c_float, ctypes.c_void_p
+            )(level, None)
+        )
+
+
 class JumpScareApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -254,6 +364,16 @@ class JumpScareApp(tk.Tk):
         self.warning_overlay_dismissed = False
         self.poster_photo = None
 
+        self.duck_percent = DEFAULT_DUCK_PERCENT
+        self.restore_seconds = DEFAULT_RESTORE_SECONDS
+        self.volume_ducked = False
+        self.saved_volume = None
+        self.duck_hold_until = 0.0  # Let the chime finish at full volume before ducking.
+        try:
+            self.volume = WindowsMasterVolume()
+        except Exception:
+            self.volume = None
+
         self.timeline_left = 34
         self.timeline_right = 34
         self.timeline_y = 72
@@ -263,6 +383,8 @@ class JumpScareApp(tk.Tk):
             value="https://notscare.me/movies/jump-scares-in-weapons-2025"
         )
         self.warning_seconds_var = tk.StringVar(value=str(DEFAULT_WARNING_SECONDS))
+        self.duck_percent_var = tk.StringVar(value=str(DEFAULT_DUCK_PERCENT))
+        self.restore_seconds_var = tk.StringVar(value=str(DEFAULT_RESTORE_SECONDS))
         self.time_var = tk.StringVar(value="00:00:00 / 02:00:00")
         self.status_var = tk.StringVar(value="Paste a NotScare movie URL and load it.")
         self.next_var = tk.StringVar(value="Next scare  —")
@@ -270,7 +392,12 @@ class JumpScareApp(tk.Tk):
         self._setup_style()
         self._build_ui()
         self.bind("<Escape>", lambda _e: self.dismiss_warning_overlay())
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(TICK_MS, self._tick)
+
+    def on_close(self):
+        self.restore_volume()
+        self.destroy()
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -309,6 +436,24 @@ class JumpScareApp(tk.Tk):
         )
         style.map("Accent.TButton", background=[("active", ACCENT_HOVER)])
 
+        # Play/pause toggle: green while stopped, blue while the timer is rolling.
+        style.configure(
+            "Play.TButton",
+            background=SUCCESS,
+            foreground="#06130e",
+            padding=(16, 9),
+            font=("Segoe UI Semibold", 10),
+        )
+        style.map("Play.TButton", background=[("active", SUCCESS_HOVER)])
+        style.configure(
+            "Pause.TButton",
+            background=ACCENT,
+            foreground=TEXT,
+            padding=(16, 9),
+            font=("Segoe UI Semibold", 10),
+        )
+        style.map("Pause.TButton", background=[("active", ACCENT_HOVER)])
+
         style.configure(
             "TEntry",
             fieldbackground=PANEL_2,
@@ -318,6 +463,31 @@ class JumpScareApp(tk.Tk):
             lightcolor=BORDER,
             darkcolor=BORDER,
             padding=8,
+        )
+
+        # Compact entries for the settings card, with an accent border on focus.
+        style.configure(
+            "Setting.TEntry",
+            fieldbackground=BG,
+            foreground=TEXT,
+            insertcolor=TEXT,
+            bordercolor=SETTINGS_BORDER,
+            lightcolor=SETTINGS_BORDER,
+            darkcolor=SETTINGS_BORDER,
+            padding=(4, 3),
+        )
+        style.map(
+            "Setting.TEntry",
+            bordercolor=[("focus", ACCENT)],
+            lightcolor=[("focus", ACCENT)],
+            fieldbackground=[("disabled", PANEL)],
+            foreground=[("disabled", MUTED)],
+        )
+        style.configure(
+            "SettingTag.TLabel",
+            background=PANEL,
+            foreground=ACCENT,
+            font=("Segoe UI Semibold", 8),
         )
 
         style.configure(
@@ -352,19 +522,59 @@ class JumpScareApp(tk.Tk):
                   font=("Segoe UI Semibold", 10)).pack(anchor="w")
         ttk.Label(brand, text="Jump-scare warning timer", style="Title.TLabel").pack(anchor="w")
 
-        warning_setting = ttk.Frame(top)
-        warning_setting.pack(side="right", padx=(16, 0))
-        ttk.Label(warning_setting, text="Warn me", style="Muted.TLabel").pack(side="left", padx=(0, 8))
-        self.warning_entry = ttk.Entry(
-            warning_setting,
-            textvariable=self.warning_seconds_var,
-            width=5,
-            justify="center",
+        # Settings card: a bordered panel with one labelled row per setting group.
+        settings = tk.Frame(top, bg=PANEL, highlightthickness=1, highlightbackground=SETTINGS_BORDER)
+        settings.pack(side="right", padx=(16, 0))
+        settings_body = ttk.Frame(settings, style="Panel.TFrame", padding=(14, 8))
+        settings_body.pack()
+
+        def setting_entry(parent, var, command):
+            entry = ttk.Entry(
+                parent,
+                textvariable=var,
+                width=4,
+                justify="center",
+                style="Setting.TEntry",
+                font=("Segoe UI Semibold", 10),
+            )
+            entry.bind("<Return>", command)
+            entry.bind("<FocusOut>", command)
+            return entry
+
+        def setting_row(row, tag, parts):
+            ttk.Label(settings_body, text=tag, style="SettingTag.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(0, 16)
+            )
+            line = ttk.Frame(settings_body, style="Panel.TFrame")
+            line.grid(row=row, column=1, sticky="w")
+            for i, part in enumerate(parts):
+                if isinstance(part, str):
+                    widget = ttk.Label(line, text=part, style="PanelMuted.TLabel")
+                else:
+                    widget = setting_entry(line, *part)
+                widget.pack(side="left", padx=(0 if i == 0 else 6, 0))
+            return line
+
+        setting_row(0, "ALERT", [
+            "Warn me",
+            (self.warning_seconds_var, self.commit_warning_seconds),
+            "seconds before",
+        ])
+        tk.Frame(settings_body, bg=SETTINGS_BORDER, height=1).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=7
         )
-        self.warning_entry.pack(side="left")
-        self.warning_entry.bind("<Return>", self.commit_warning_seconds)
-        self.warning_entry.bind("<FocusOut>", self.commit_warning_seconds)
-        ttk.Label(warning_setting, text="seconds before", style="Muted.TLabel").pack(side="left", padx=(8, 0))
+        volume_line = setting_row(2, "VOLUME", [
+            "Drop to",
+            (self.duck_percent_var, self.commit_duck_percent),
+            "% until",
+            (self.restore_seconds_var, self.commit_restore_seconds),
+            "seconds after",
+        ])
+        if self.volume is None:
+            for child in volume_line.winfo_children():
+                if isinstance(child, ttk.Entry):
+                    child.state(["disabled"])
+            ttk.Label(volume_line, text="(unavailable)", style="PanelMuted.TLabel").pack(side="left", padx=(6, 0))
 
         url_panel = ttk.Frame(self.main, style="Panel.TFrame", padding=12)
         url_panel.pack(fill="x", pady=(16, 12))
@@ -435,7 +645,8 @@ class JumpScareApp(tk.Tk):
         controls = ttk.Frame(self.main)
         controls.pack(fill="x", pady=(0, 12))
         ttk.Button(controls, text="-15 sec", command=lambda: self.seek_relative(-15)).pack(side="left", padx=(0, 7))
-        self.play_btn = ttk.Button(controls, text="Start", style="Accent.TButton", command=self.toggle_play)
+        self.play_btn = ttk.Button(controls, width=11, command=self.toggle_play)
+        self.set_play_button(False)
         self.play_btn.pack(side="left", padx=(0, 7))
         ttk.Button(controls, text="+15 sec", command=lambda: self.seek_relative(15)).pack(side="left", padx=(0, 7))
         ttk.Button(controls, text="Restart", command=self.restart).pack(side="left")
@@ -562,6 +773,87 @@ class JumpScareApp(tk.Tk):
         self.status_var.set(f"Warnings set to {self.warning_seconds} seconds before each scare.")
         return "break"
 
+    def _parse_int_setting(self, var, current, low, high, label):
+        """Return the entry's int value, or None (and revert it) if out of range."""
+        try:
+            value = int(var.get().strip())
+            if not low <= value <= high:
+                raise ValueError
+        except ValueError:
+            var.set(str(current))
+            self.status_var.set(f"{label} must be {low}-{high}.")
+            return None
+        var.set(str(value))
+        return value
+
+    def commit_duck_percent(self, _event=None):
+        value = self._parse_int_setting(
+            self.duck_percent_var, self.duck_percent, 0, 100, "Warning volume percent"
+        )
+        if value is not None and value != self.duck_percent:
+            self.duck_percent = value
+            if self.volume_ducked:
+                self._set_volume(min(self.saved_volume, value / 100))
+            self.status_var.set(f"Volume drops to {value}% during warnings.")
+        return "break"
+
+    def commit_restore_seconds(self, _event=None):
+        value = self._parse_int_setting(
+            self.restore_seconds_var, self.restore_seconds, 0, MAX_RESTORE_SECONDS,
+            "Volume restore delay",
+        )
+        if value is not None and value != self.restore_seconds:
+            self.restore_seconds = value
+            self.update_volume_duck()
+            self.status_var.set(f"Volume restores {value} seconds after each scare.")
+        return "break"
+
+    def _set_volume(self, level):
+        try:
+            self.volume.set(level)
+            return True
+        except Exception as exc:
+            self.status_var.set(f"Could not change system volume: {exc}")
+            return False
+
+    def in_duck_window(self):
+        return any(
+            scare["time"] - self.warning_seconds <= self.position < scare["time"] + self.restore_seconds
+            for scare in self.scares
+        )
+
+    def update_volume_duck(self):
+        """Lower the system volume while inside any scare's warning/restore window."""
+        if self.volume is None:
+            return
+
+        if self.in_duck_window():
+            # Only start ducking while the timer is rolling, and not until the chime ends.
+            if self.volume_ducked or not self.playing or time.monotonic() < self.duck_hold_until:
+                return
+            try:
+                self.saved_volume = self.volume.get()
+            except Exception as exc:
+                self.status_var.set(f"Could not read system volume: {exc}")
+                return
+            # Never raise the volume if it was already below the warning level.
+            if self._set_volume(min(self.saved_volume, self.duck_percent / 100)):
+                self.volume_ducked = True
+        else:
+            self.restore_volume()
+
+    def restore_volume(self):
+        if not self.volume_ducked:
+            return
+        self.volume_ducked = False
+        try:
+            # If the user changed the volume by hand during the warning, keep their choice.
+            current = self.volume.get()
+            if abs(current - min(self.saved_volume, self.duck_percent / 100)) < 0.01:
+                self.volume.set(self.saved_volume)
+        except Exception as exc:
+            self.status_var.set(f"Could not restore system volume: {exc}")
+
     def load_movie(self):
         self.commit_warning_seconds()
         url = self.url_var.get().strip()
@@ -592,6 +884,7 @@ class JumpScareApp(tk.Tk):
         self.active_warning_index = None
         self.warning_overlay_dismissed = False
         self.hide_warning_overlay()
+        self.restore_volume()
 
         self.movie_label.config(text=self.movie_title)
         majors = sum(1 for s in self.scares if s["severity"].lower() == "major")
@@ -599,7 +892,7 @@ class JumpScareApp(tk.Tk):
         self.movie_meta.config(
             text=f"{seconds_to_hms(self.duration)} runtime  •  {len(self.scares)} scares  •  {majors} major  •  {minors} minor"
         )
-        self.play_btn.config(text="Start")
+        self.set_play_button(False)
 
         self.set_poster(result.get("poster_bytes"))
         self.refresh_tree()
@@ -657,6 +950,19 @@ class JumpScareApp(tk.Tk):
         self.status_var.set("Could not load movie.")
         messagebox.showerror("Load Failed", error)
 
+    def set_play_button(self, playing):
+        if playing:
+            if not hasattr(self, "pause_icon"):
+                # Drawn as an image so the two bars sit a fixed, tight distance apart
+                # (font glyphs space them very differently between fonts).
+                self.pause_icon = tk.PhotoImage(width=10, height=12)
+                self.pause_icon.put(TEXT, to=(1, 1, 4, 12))
+                self.pause_icon.put(TEXT, to=(6, 1, 9, 12))
+            self.play_btn.config(text=" Pause", image=self.pause_icon, compound="left",
+                                 style="Pause.TButton")
+        else:
+            self.play_btn.config(text="▶  Start", image="", style="Play.TButton")
+
     def toggle_play(self):
         if not self.scares:
             messagebox.showinfo("Load a Movie", "Load a NotScare movie first.")
@@ -670,7 +976,7 @@ class JumpScareApp(tk.Tk):
 
         self.playing = not self.playing
         self.last_tick = time.monotonic()
-        self.play_btn.config(text="Pause" if self.playing else "Start")
+        self.set_play_button(self.playing)
         self.status_var.set("Timer running." if self.playing else "Timer paused.")
 
     def restart(self):
@@ -680,8 +986,9 @@ class JumpScareApp(tk.Tk):
         self.last_tick = None
         self.active_warning_index = None
         self.warning_overlay_dismissed = False
-        self.play_btn.config(text="Start")
+        self.set_play_button(False)
         self.hide_warning_overlay()
+        self.restore_volume()
         self.update_display()
         self.draw_timeline()
 
@@ -707,6 +1014,7 @@ class JumpScareApp(tk.Tk):
         self.warning_overlay_dismissed = False
         self.hide_warning_overlay()
         self.last_tick = time.monotonic()
+        self.update_volume_duck()
         self.update_display()
         self.draw_timeline()
 
@@ -727,10 +1035,12 @@ class JumpScareApp(tk.Tk):
 
             self.check_warnings(old_position, self.position)
             self.update_warning_overlay()
+            self.update_volume_duck()
 
             if self.position >= self.duration:
                 self.playing = False
-                self.play_btn.config(text="Start")
+                self.set_play_button(False)
+                self.restore_volume()
                 self.status_var.set("Movie timer finished.")
 
             self.update_display()
@@ -821,34 +1131,16 @@ class JumpScareApp(tk.Tk):
             if sys.platform.startswith("win"):
                 import winsound
 
+                sequence = CHIME_MAJOR if severity.lower() == "major" else CHIME_MINOR
+
+                # The chime shares the master volume, so hold off ducking until it ends.
+                chime_seconds = sum(d for _f, d in sequence) / 1000 + CHIME_NOTE_GAP * len(sequence)
+                self.duck_hold_until = time.monotonic() + chime_seconds + 0.2
+
                 def beep():
-                    # Bright, consonant note patterns:
-                    # Minor = short rising "ding-ding"
-                    # Major = slightly longer happy arpeggio
-                    if severity.lower() == "major":
-                        sequence = [
-                            (523, 140),   # C5
-                            (659, 140),   # E5
-                            (784, 160),   # G5
-                            (1047, 260),  # C6
-                            (784, 160),   # G5
-                            (659, 140),   # E5
-                            (523, 140),   # C5
-
-
-
-                        ]
-                    else:
-                        sequence = [
-                            (523, 140),   # C5
-                            (659, 140),   # E5
-                            (784, 160),   # G5
-                            (1047, 260),  # C6
-                        ]
-
                     for freq, duration in sequence:
                         winsound.Beep(freq, duration)
-                        time.sleep(0.055)
+                        time.sleep(CHIME_NOTE_GAP)
 
                 threading.Thread(target=beep, daemon=True).start()
             else:
