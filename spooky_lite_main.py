@@ -1,5 +1,6 @@
 import ctypes
 import io
+import os
 import re
 import sys
 import time
@@ -21,6 +22,14 @@ try:
 except ImportError:
     Image = None
     ImageTk = None
+
+
+def resource_path(*parts):
+    """Resolve a bundled resource path, working both from source and from a
+    PyInstaller --onefile build (where data files are unpacked to a temp
+    dir referenced by sys._MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, *parts)
 
 
 TICK_MS = 100
@@ -351,6 +360,7 @@ class JumpScareApp(tk.Tk):
         self.geometry("1180x780")
         self.minsize(940, 650)
         self.configure(bg=BG)
+        self._set_app_icon()
 
         self.movie_title = ""
         self.duration = DEFAULT_RUNTIME
@@ -508,6 +518,24 @@ class JumpScareApp(tk.Tk):
         )
         style.map("Treeview", background=[("selected", "#24456f")])
         style.map("Treeview.Heading", background=[("active", BORDER)])
+
+    def _set_app_icon(self):
+        """Set the window/taskbar icon to the cartoon ghost in assets/.
+        Best-effort: missing assets or an unsupported platform just falls
+        back to Tk's default icon instead of crashing the app."""
+        ico_path = resource_path("assets", "icon.ico")
+        try:
+            self.iconbitmap(ico_path)
+            return
+        except Exception:
+            pass
+        png_path = resource_path("assets", "icon.png")
+        if Image is not None and ImageTk is not None:
+            try:
+                self._app_icon_img = ImageTk.PhotoImage(Image.open(png_path))
+                self.iconphoto(True, self._app_icon_img)
+            except Exception:
+                pass
 
     def _build_ui(self):
         self.main = ttk.Frame(self, padding=(18, 16))

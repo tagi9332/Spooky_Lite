@@ -190,16 +190,24 @@ pip install pyinstaller
 Build the application:
 
 ```bash
-pyinstaller --onefile --windowed spooky_lite.py
+pyinstaller --onefile --windowed --name SpookyLite --icon assets\icon.ico --add-data "assets;assets" spooky_lite_main.py
 ```
 
 The resulting executable will be placed in:
 
 ```text
-dist/
+dist/SpookyLite.exe
 ```
 
-Additional configuration may be useful for application icons and bundled resources.
+### App Icon
+
+The app ships with a small cartoon ghost icon (`assets/icon.ico` / `assets/icon.png`), used both as the `.exe` file icon (via `--icon`) and as the app's window/taskbar icon while it's running. It's generated procedurally with Pillow — no external image files needed. To regenerate or tweak it:
+
+```bash
+python assets/make_icon.py
+```
+
+then rebuild the executable so the updated icon gets embedded.
 
 ---
 
