@@ -34,26 +34,27 @@ def resource_path(*parts):
 
 TICK_MS = 100
 DEFAULT_RUNTIME = 2 * 60 * 60
-DEFAULT_WARNING_SECONDS = 30
+DEFAULT_WARNING_SECONDS = 20
 MIN_WARNING_SECONDS = 1
 MAX_WARNING_SECONDS = 600
-DEFAULT_DUCK_PERCENT = 5
-DEFAULT_RESTORE_SECONDS = 30
+DEFAULT_DUCK_PERCENT = 15
+DEFAULT_RESTORE_SECONDS = 10
 MAX_RESTORE_SECONDS = 600
+VOLUME_RESTORE_RAMP_SECONDS = 5.0
 
 # Chime note patterns as (frequency Hz, duration ms).
 # Minor = short rising "ding-ding", Major = slightly longer happy arpeggio.
 CHIME_NOTE_GAP = 0.055
 CHIME_MINOR = [
-    (523, 140),   # C5
-    (659, 140),   # E5
-    (784, 160),   # G5
-    (1047, 260),  # C6
+    (523, 80),   # C5
+    (659, 80),   # E5
+    (784, 80),   # G5
+    (1047, 100),  # C6
 ]
 CHIME_MAJOR = CHIME_MINOR + [
-    (784, 160),   # G5
-    (659, 140),   # E5
-    (523, 140),   # C5
+    (784, 80),   # G5
+    (659, 80),   # E5
+    (523, 100),   # C5
 ]
 
 # Modern dark palette
@@ -379,6 +380,10 @@ class JumpScareApp(tk.Tk):
         self.volume_ducked = False
         self.saved_volume = None
         self.duck_hold_until = 0.0  # Let the chime finish at full volume before ducking.
+        self.ramp_active = False
+        self.ramp_start_time = 0.0
+        self.ramp_start_volume = 0.0
+        self.ramp_target_volume = 0.0
         try:
             self.volume = WindowsMasterVolume()
         except Exception:
@@ -673,9 +678,11 @@ class JumpScareApp(tk.Tk):
         controls = ttk.Frame(self.main)
         controls.pack(fill="x", pady=(0, 12))
         ttk.Button(controls, text="-15 sec", command=lambda: self.seek_relative(-15)).pack(side="left", padx=(0, 7))
+        ttk.Button(controls, text="-1 sec", command=lambda: self.seek_relative(-1)).pack(side="left", padx=(0, 7))
         self.play_btn = ttk.Button(controls, width=11, command=self.toggle_play)
         self.set_play_button(False)
         self.play_btn.pack(side="left", padx=(0, 7))
+        ttk.Button(controls, text="+1 sec", command=lambda: self.seek_relative(1)).pack(side="left", padx=(0, 7))
         ttk.Button(controls, text="+15 sec", command=lambda: self.seek_relative(15)).pack(side="left", padx=(0, 7))
         ttk.Button(controls, text="Restart", command=self.restart).pack(side="left")
 
@@ -859,6 +866,7 @@ class JumpScareApp(tk.Tk):
             # Only start ducking while the timer is rolling, and not until the chime ends.
             if self.volume_ducked or not self.playing or time.monotonic() < self.duck_hold_until:
                 return
+            self.ramp_active = False
             try:
                 self.saved_volume = self.volume.get()
             except Exception as exc:
@@ -878,9 +886,27 @@ class JumpScareApp(tk.Tk):
             # If the user changed the volume by hand during the warning, keep their choice.
             current = self.volume.get()
             if abs(current - min(self.saved_volume, self.duck_percent / 100)) < 0.01:
-                self.volume.set(self.saved_volume)
+                self.ramp_active = True
+                self.ramp_start_time = time.monotonic()
+                self.ramp_start_volume = current
+                self.ramp_target_volume = self.saved_volume
+            else:
+                self.ramp_active = False
         except Exception as exc:
             self.status_var.set(f"Could not restore system volume: {exc}")
+
+    def update_volume_ramp(self):
+        """Ease the volume back up to its pre-warning level instead of snapping to it."""
+        if not self.ramp_active or self.volume is None:
+            return
+        elapsed = time.monotonic() - self.ramp_start_time
+        if elapsed >= VOLUME_RESTORE_RAMP_SECONDS:
+            self._set_volume(self.ramp_target_volume)
+            self.ramp_active = False
+            return
+        fraction = elapsed / VOLUME_RESTORE_RAMP_SECONDS
+        level = self.ramp_start_volume + (self.ramp_target_volume - self.ramp_start_volume) * fraction
+        self._set_volume(level)
 
     def load_movie(self):
         self.commit_warning_seconds()
@@ -1074,6 +1100,7 @@ class JumpScareApp(tk.Tk):
             self.update_display()
             self.draw_timeline()
 
+        self.update_volume_ramp()
         self.after(TICK_MS, self._tick)
 
     def check_warnings(self, old_position, new_position):
