@@ -29,6 +29,20 @@ Paste in a NotScare.Me movie URL, and Spooky Lite will load the movie's jump-sca
 
 ---
 
+## Download (Windows)
+
+No Python required:
+
+1. Go to the [latest release](https://github.com/tagi9332/Spooky_Lite/releases/latest).
+2. Download `SpookyLite.exe` under **Assets**.
+3. Double-click it to run.
+
+The executable isn't code-signed, so Windows SmartScreen may show "Windows protected your PC" the first time. Click **More info → Run anyway**.
+
+To run from source instead, see below.
+
+---
+
 ## Requirements
 
 - Python 3.10+
@@ -50,8 +64,8 @@ Tkinter is normally included with standard Python installations on Windows.
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/spooky-lite.git
-cd spooky-lite
+git clone https://github.com/tagi9332/Spooky_Lite.git
+cd Spooky_Lite
 ```
 
 Install the dependencies:
@@ -190,7 +204,7 @@ pip install pyinstaller
 Build the application:
 
 ```bash
-pyinstaller --onefile --windowed --name SpookyLite --icon assets\icon.ico --add-data "assets;assets" spooky_lite_main.py
+pyinstaller --noconfirm SpookyLite.spec
 ```
 
 The resulting executable will be placed in:
@@ -199,9 +213,20 @@ The resulting executable will be placed in:
 dist/SpookyLite.exe
 ```
 
+### Publishing a Release
+
+Releases are built automatically by GitHub Actions (`.github/workflows/release.yml`). Push a version tag and the workflow builds `SpookyLite.exe` on Windows and attaches it to a new GitHub Release:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+To test the build without publishing, open the **Actions** tab, pick **Build Windows release**, and click **Run workflow**. The `.exe` is available as a downloadable artifact on the run page.
+
 ### App Icon
 
-The app ships with a small cartoon ghost icon (`assets/icon.ico` / `assets/icon.png`), used both as the `.exe` file icon (via `--icon`) and as the app's window/taskbar icon while it's running. It's generated procedurally with Pillow — no external image files needed. To regenerate or tweak it:
+The app ships with a small cartoon ghost icon (`assets/icon.ico` / `assets/icon.png`), used both as the `.exe` file icon (set in `SpookyLite.spec`) and as the app's window/taskbar icon while it's running. It's generated procedurally with Pillow — no external image files needed. To regenerate or tweak it:
 
 ```bash
 python assets/make_icon.py

@@ -8,7 +8,7 @@ import time
 import threading
 import uuid
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, font as tkfont
 from urllib.parse import urlparse
 
 try:
@@ -38,7 +38,7 @@ DEFAULT_RUNTIME = 2 * 60 * 60
 DEFAULT_WARNING_SECONDS = 20
 MIN_WARNING_SECONDS = 1
 MAX_WARNING_SECONDS = 600
-DEFAULT_DUCK_PERCENT = 15
+DEFAULT_DUCK_PERCENT = 10
 DEFAULT_RESTORE_SECONDS = 10
 MAX_RESTORE_SECONDS = 600
 VOLUME_RESTORE_RAMP_SECONDS = 5.0
@@ -537,6 +537,386 @@ class WindowsMasterVolume:
         )
 
 
+def app_is_foreground(widget):
+    """Return True while one of this process's windows is the active window.
+
+    Tk's <Deactivate>/<FocusOut> events don't fire reliably on Windows when
+    the user alt-tabs away, so ask the OS which process owns the foreground
+    window. Other platforms fall back to Tk's own focus tracking."""
+    if sys.platform.startswith("win"):
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
+            pid = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return pid.value == os.getpid()
+        except Exception:
+            pass
+    try:
+        return bool(widget.tk.call("focus", "-displayof", widget))
+    except tk.TclError:
+        return True
+
+
+def flat_entry(parent, bg=BG, pad=3, **kwargs):
+    """A tk.Entry with the same thin 1px border as DarkDropdown: muted at
+    rest, accent on hover and focus. Plain tk.Entry is used instead of
+    ttk.Entry because clam draws bright corner pixels on its entry border.
+    pad is the inner spacing, drawn by a flat border in the field color."""
+    entry = tk.Entry(
+        parent,
+        bg=bg,
+        fg=TEXT,
+        insertbackground=TEXT,
+        disabledbackground=PANEL,
+        disabledforeground=MUTED,
+        relief="flat",
+        bd=pad,
+        highlightthickness=1,
+        highlightbackground=SETTINGS_BORDER,
+        highlightcolor=ACCENT,
+        **kwargs,
+    )
+
+    def on_hover(lit):
+        if entry.cget("state") != "disabled":
+            entry.configure(highlightbackground=ACCENT if lit else SETTINGS_BORDER)
+
+    def on_leave(event):
+        # Moving onto a child (e.g. a placeholder label) isn't leaving the entry.
+        under = str(entry.winfo_containing(event.x_root, event.y_root) or "")
+        if under != str(entry) and not under.startswith(str(entry) + "."):
+            on_hover(False)
+
+    entry.bind("<Enter>", lambda _e: on_hover(True))
+    entry.bind("<Leave>", on_leave)
+    return entry
+
+
+def elide(text, font, max_px):
+    """Trim text with a trailing ellipsis so it fits within max_px."""
+    if font.measure(text) <= max_px:
+        return text
+    while text and font.measure(text + "…") > max_px:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+class DarkDropdown(tk.Frame):
+    """Flat, dark replacement for ttk.Combobox.
+
+    The stock combobox popdown is a native always-on-top window that ignores
+    most theming and, on Windows, can stay floating over other applications
+    after an alt-tab. This draws its own list in an ordinary popup and closes
+    it whenever the app loses focus, the main window moves, or the user clicks
+    anywhere else.
+
+    Entries are dicts: {"header": "Season 1"} for a non-selectable section
+    label, or {"value": ..., "tag": "S01E02", "list_tag": "E02",
+    "text": "Title", "detail": "3 scares"} for a selectable option.
+    """
+
+    HEIGHT = 34
+    MAX_POPUP_HEIGHT = 340
+    FOCUS_POLL_MS = 150
+    HOVER_BG = BORDER
+
+    def __init__(self, parent, command=None, width=440):
+        super().__init__(
+            parent,
+            width=width,
+            height=self.HEIGHT,
+            bg=BG,
+            cursor="hand2",
+            takefocus=1,
+            highlightthickness=1,
+            highlightbackground=SETTINGS_BORDER,
+            highlightcolor=ACCENT,
+        )
+        self.pack_propagate(False)
+        self.command = command
+        self.entries = []
+        self.selected_value = None
+        self._popup = None
+        self._canvas = None
+        self._rows = []  # (value, [widgets to recolor on hover]) per selectable entry
+        self._hover = None
+        self._watch_job = None
+
+        self._tag_font = tkfont.Font(family="Segoe UI Semibold", size=10)
+        self._text_font = tkfont.Font(family="Segoe UI", size=10)
+        self._detail_font = tkfont.Font(family="Segoe UI", size=9)
+        self._header_font = tkfont.Font(family="Segoe UI Semibold", size=8)
+
+        self._tag_label = tk.Label(self, bg=BG, fg=ACCENT, font=self._tag_font)
+        self._chevron = tk.Label(self, text="▾", bg=BG, fg=MUTED, font=self._text_font)
+        self._detail_label = tk.Label(self, bg=BG, fg=MUTED, font=self._detail_font)
+        self._text_label = tk.Label(self, bg=BG, fg=TEXT, font=self._text_font, anchor="w")
+        self._tag_label.pack(side="left", padx=(10, 8))
+        self._chevron.pack(side="right", padx=(6, 10))
+        self._detail_label.pack(side="right")
+        self._text_label.pack(side="left", fill="x", expand=True)
+
+        for widget in (self, self._tag_label, self._text_label, self._detail_label, self._chevron):
+            widget.bind("<Button-1>", self._on_trigger_click)
+            widget.bind("<Enter>", lambda _e: self._paint_trigger(hover=True))
+            widget.bind("<Leave>", lambda _e: self._paint_trigger(hover=False))
+            widget.bind("<MouseWheel>", self._on_wheel)
+        for key in ("<Down>", "<Up>", "<Return>", "<space>", "<Escape>"):
+            self.bind(key, self._on_key)
+
+        top = self.winfo_toplevel()
+        self.bind_all("<Button-1>", self._on_global_click, add="+")
+        top.bind("<Configure>", self._on_toplevel_change, add="+")
+        top.bind("<Unmap>", self._on_toplevel_change, add="+")
+
+        self._update_trigger()
+
+    # Public API -----------------------------------------------------------
+
+    def set_entries(self, entries):
+        self.close()
+        self.entries = list(entries)
+        if self._entry_for(self.selected_value) is None:
+            self.selected_value = None
+        self._update_trigger()
+
+    def select(self, value):
+        """Show value as the current choice without firing the command."""
+        self.selected_value = value
+        self._update_trigger()
+
+    def open(self):
+        if self._popup is not None or not any("value" in e for e in self.entries):
+            return
+
+        width = self.winfo_width()
+        popup = tk.Toplevel(self)
+        popup.withdraw()
+        popup.overrideredirect(True)
+        popup.configure(bg=SETTINGS_BORDER)
+        body = tk.Frame(popup, bg=BG)
+        body.pack(fill="both", expand=True, padx=1, pady=1)
+
+        canvas = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0, yscrollincrement=1)
+        inner = tk.Frame(canvas, bg=BG)
+        window_id = canvas.create_window(0, 0, window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+        for widget in (canvas, inner):
+            widget.bind("<MouseWheel>", self._on_wheel)
+
+        self._popup = popup
+        self._canvas = canvas
+        self._rows = []
+        self._hover = None
+        for entry in self.entries:
+            if "header" in entry:
+                label = tk.Label(inner, text=entry["header"].upper(), bg=BG, fg=ACCENT,
+                                 font=self._header_font, anchor="w")
+                label.pack(fill="x", padx=14, pady=(8, 2))
+                label.bind("<MouseWheel>", self._on_wheel)
+            else:
+                self._add_row(inner, entry, width)
+
+        popup.update_idletasks()
+        content_h = inner.winfo_reqheight()
+        view_h = min(content_h, self.MAX_POPUP_HEIGHT)
+        if content_h > view_h:
+            scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview,
+                                      style="Dropdown.Vertical.TScrollbar")
+            scrollbar.pack(side="right", fill="y", padx=(0, 3), pady=3)
+            canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.configure(height=view_h, scrollregion=(0, 0, 0, content_h))
+        canvas.pack(side="left", fill="both", expand=True)
+
+        # Drop below the trigger, or flip above it if there's no room.
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height() + 4
+        popup_h = view_h + 2
+        if y + popup_h > self.winfo_screenheight() - 48:
+            y = self.winfo_rooty() - popup_h - 4
+        popup.geometry(f"{width}x{popup_h}+{x}+{y}")
+        popup.deiconify()
+        popup.lift()
+
+        selected = self._selected_index()
+        if selected is not None:
+            popup.update_idletasks()
+            self._ensure_visible(selected)
+
+        self._paint_trigger()
+        self.focus_set()
+        self._watch_job = self.after(self.FOCUS_POLL_MS, self._watch_focus)
+
+    def close(self):
+        if self._watch_job is not None:
+            self.after_cancel(self._watch_job)
+            self._watch_job = None
+        if self._popup is not None:
+            self._popup.destroy()
+            self._popup = None
+            self._canvas = None
+            self._rows = []
+            self._hover = None
+        self._paint_trigger()
+
+    # Internals ------------------------------------------------------------
+
+    def _entry_for(self, value):
+        if value is None:
+            return None
+        return next((e for e in self.entries if e.get("value") == value), None)
+
+    def _selected_index(self):
+        return next((i for i, (value, _w) in enumerate(self._rows) if value == self.selected_value), None)
+
+    def _update_trigger(self):
+        entry = self._entry_for(self.selected_value) or {}
+        tag = entry.get("tag", "")
+        detail = entry.get("detail", "")
+        text = entry.get("text", "Select…")
+        self._tag_label.config(text=tag)
+        self._detail_label.config(text=detail)
+        available = (
+            int(self.cget("width"))
+            - self._tag_font.measure(tag) - 18
+            - self._detail_font.measure(detail)
+            - self._text_font.measure("▾") - 24
+            - 8
+        )
+        self._text_label.config(text=elide(text, self._text_font, available),
+                                fg=TEXT if entry else MUTED)
+
+    def _paint_trigger(self, hover=False):
+        is_open = self._popup is not None
+        lit = is_open or hover
+        self.configure(highlightbackground=ACCENT if lit else SETTINGS_BORDER)
+        self._chevron.configure(text="▴" if is_open else "▾", fg=ACCENT if lit else MUTED)
+
+    def _add_row(self, parent, entry, width):
+        selected = entry["value"] == self.selected_value
+        list_tag = entry.get("list_tag", entry.get("tag", ""))
+        detail_text = entry.get("detail", "")
+
+        row = tk.Frame(parent, bg=BG, cursor="hand2")
+        row.pack(fill="x")
+        bar = tk.Frame(row, bg=ACCENT if selected else BG, width=3)
+        bar.pack(side="left", fill="y")
+        tag = tk.Label(row, text=list_tag, bg=BG, fg=ACCENT if selected else MUTED, font=self._tag_font)
+        tag.pack(side="left", padx=(11, 10), pady=6)
+        detail = tk.Label(row, text=detail_text, bg=BG, fg=MUTED, font=self._detail_font)
+        detail.pack(side="right", padx=(8, 16))
+        available = (
+            width - 2 - 3 - 21 - 24 - 12  # border, bar, paddings, scrollbar allowance
+            - self._tag_font.measure(list_tag)
+            - self._detail_font.measure(detail_text)
+        )
+        text = tk.Label(row, text=elide(entry.get("text", ""), self._text_font, available),
+                        bg=BG, fg=TEXT, font=self._text_font, anchor="w")
+        text.pack(side="left", fill="x", expand=True)
+
+        index = len(self._rows)
+        self._rows.append((entry["value"], [row, tag, detail, text]))
+        for widget in (row, bar, tag, detail, text):
+            widget.bind("<Enter>", lambda _e, i=index: self._set_hover(i))
+            widget.bind("<Button-1>", lambda _e, i=index: self._choose(i))
+            widget.bind("<MouseWheel>", self._on_wheel)
+
+    def _set_hover(self, index):
+        if index == self._hover:
+            return
+        if self._hover is not None:
+            for widget in self._rows[self._hover][1]:
+                widget.configure(bg=BG)
+        self._hover = index
+        if index is not None:
+            for widget in self._rows[index][1]:
+                widget.configure(bg=self.HOVER_BG)
+
+    def _ensure_visible(self, index):
+        canvas = self._canvas
+        if canvas is None:
+            return
+        row = self._rows[index][1][0]
+        total = max(1, int(canvas.cget("scrollregion").split()[3]))
+        view_h = canvas.winfo_height()
+        first = canvas.canvasy(0)
+        top = row.winfo_y()
+        bottom = top + row.winfo_height()
+        if top < first:
+            canvas.yview_moveto(top / total)
+        elif bottom > first + view_h:
+            canvas.yview_moveto((bottom - view_h) / total)
+
+    def _choose(self, index):
+        value = self._rows[index][0]
+        self.close()
+        self.select(value)
+        if self.command:
+            self.command(value)
+        return "break"
+
+    def _on_trigger_click(self, _event):
+        self.focus_set()
+        if self._popup is None:
+            self.open()
+        else:
+            self.close()
+        return "break"
+
+    def _on_key(self, event):
+        key = event.keysym
+        if self._popup is None:
+            if key in ("Down", "Return", "space"):
+                self.open()
+                return "break"
+            return None
+        if key == "Escape":
+            self.close()
+        elif key in ("Return", "space"):
+            if self._hover is not None:
+                self._choose(self._hover)
+            else:
+                self.close()
+        else:
+            start = self._hover if self._hover is not None else self._selected_index()
+            step = 1 if key == "Down" else -1
+            index = 0 if start is None else max(0, min(len(self._rows) - 1, start + step))
+            self._set_hover(index)
+            self._ensure_visible(index)
+        return "break"
+
+    def _on_wheel(self, event):
+        if self._canvas is None:
+            return None
+        self._canvas.yview_scroll(int(-event.delta / 120 * 40), "units")
+        return "break"
+
+    def _on_global_click(self, event):
+        if self._popup is None:
+            return
+        clicked = str(event.widget)
+        for owner in (str(self._popup), str(self)):
+            if clicked == owner or clicked.startswith(owner + "."):
+                return
+        self.close()
+
+    def _on_toplevel_change(self, event):
+        if event.widget is self.winfo_toplevel():
+            self.close()
+
+    def _watch_focus(self):
+        self._watch_job = None
+        if self._popup is None:
+            return
+        if not app_is_foreground(self):
+            self.close()
+            return
+        self._watch_job = self.after(self.FOCUS_POLL_MS, self._watch_focus)
+
+
 class JumpScareApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -561,7 +941,6 @@ class JumpScareApp(tk.Tk):
 
         self.series_mode = False
         self.series_data = None
-        self.episode_lookup = []  # combobox index -> (season, episode)
 
         self.duck_percent = DEFAULT_DUCK_PERCENT
         self.restore_seconds = DEFAULT_RESTORE_SECONDS
@@ -581,6 +960,7 @@ class JumpScareApp(tk.Tk):
         self.timeline_right = 34
         self.timeline_y = 72
         self.timeline_marker_info = []
+        self.timeline_hover_x = None  # mouse x while hovering the timeline
 
         self.url_var = tk.StringVar(
             value="https://notscare.me/movies/jump-scares-in-weapons-2025"
@@ -595,10 +975,6 @@ class JumpScareApp(tk.Tk):
         self._setup_style()
         self._build_ui()
         self.bind("<Escape>", lambda _e: self.dismiss_warning_overlay())
-        # Windows doesn't always close an open ttk Combobox dropdown when the
-        # user alt-tabs or clicks another application; force it shut so it
-        # can't stay on top of other windows.
-        self.bind("<Deactivate>", lambda _e: self._close_episode_dropdown())
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(TICK_MS, self._tick)
 
@@ -662,35 +1038,6 @@ class JumpScareApp(tk.Tk):
         style.map("Pause.TButton", background=[("active", ACCENT_HOVER)])
 
         style.configure(
-            "TEntry",
-            fieldbackground=PANEL_2,
-            foreground=TEXT,
-            insertcolor=TEXT,
-            bordercolor=BORDER,
-            lightcolor=BORDER,
-            darkcolor=BORDER,
-            padding=8,
-        )
-
-        # Compact entries for the settings card, with an accent border on focus.
-        style.configure(
-            "Setting.TEntry",
-            fieldbackground=BG,
-            foreground=TEXT,
-            insertcolor=TEXT,
-            bordercolor=SETTINGS_BORDER,
-            lightcolor=SETTINGS_BORDER,
-            darkcolor=SETTINGS_BORDER,
-            padding=(4, 3),
-        )
-        style.map(
-            "Setting.TEntry",
-            bordercolor=[("focus", ACCENT)],
-            lightcolor=[("focus", ACCENT)],
-            fieldbackground=[("disabled", PANEL)],
-            foreground=[("disabled", MUTED)],
-        )
-        style.configure(
             "SettingTag.TLabel",
             background=PANEL,
             foreground=ACCENT,
@@ -715,6 +1062,29 @@ class JumpScareApp(tk.Tk):
         )
         style.map("Treeview", background=[("selected", "#24456f")])
         style.map("Treeview.Heading", background=[("active", BORDER)])
+
+        # Slim, arrowless scrollbar for the episode dropdown list.
+        style.layout("Dropdown.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+            ]}),
+        ])
+        style.configure(
+            "Dropdown.Vertical.TScrollbar",
+            troughcolor=BG,
+            background=SETTINGS_BORDER,
+            bordercolor=BG,
+            lightcolor=SETTINGS_BORDER,
+            darkcolor=SETTINGS_BORDER,
+            arrowsize=6,
+            gripcount=0,
+        )
+        style.map(
+            "Dropdown.Vertical.TScrollbar",
+            background=[("active", ACCENT)],
+            lightcolor=[("active", ACCENT)],
+            darkcolor=[("active", ACCENT)],
+        )
 
     def _set_app_icon(self):
         """Set the window/taskbar icon to the cartoon ghost in assets/.
@@ -754,15 +1124,24 @@ class JumpScareApp(tk.Tk):
         settings_body.pack()
 
         def setting_entry(parent, var, command):
-            entry = ttk.Entry(
+            entry = flat_entry(
                 parent,
+                pad=3,
                 textvariable=var,
                 width=4,
                 justify="center",
-                style="Setting.TEntry",
                 font=("Segoe UI Semibold", 10),
             )
-            entry.bind("<Return>", command)
+
+            def on_enter(event):
+                # Commit, then drop focus so the cursor and accent border
+                # disappear, signalling the value was accepted.
+                command(event)
+                self.focus_set()
+                return "break"
+
+            entry.bind("<Return>", on_enter)
+            entry.bind("<KP_Enter>", on_enter)
             entry.bind("<FocusOut>", command)
             return entry
 
@@ -797,15 +1176,33 @@ class JumpScareApp(tk.Tk):
         ])
         if self.volume is None:
             for child in volume_line.winfo_children():
-                if isinstance(child, ttk.Entry):
-                    child.state(["disabled"])
+                if isinstance(child, tk.Entry):
+                    child.configure(state="disabled")
             ttk.Label(volume_line, text="(unavailable)", style="PanelMuted.TLabel").pack(side="left", padx=(6, 0))
 
         url_panel = ttk.Frame(self.main, style="Panel.TFrame", padding=12)
         url_panel.pack(fill="x", pady=(16, 12))
 
-        self.url_entry = ttk.Entry(url_panel, textvariable=self.url_var)
+        self.url_entry = flat_entry(url_panel, bg=PANEL_2, pad=8, textvariable=self.url_var)
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.url_entry.bind("<Return>", self._on_url_enter)
+        self.url_entry.bind("<KP_Enter>", self._on_url_enter)
+
+        # Placeholder hint shown while the URL box is empty. It sits just right
+        # of the caret so the cursor stays visible when the box is focused.
+        self.url_placeholder = tk.Label(
+            self.url_entry,
+            text="Paste a notscare.me movie or TV show link — e.g. https://notscare.me/movies/jump-scares-in-…",
+            bg=PANEL_2,
+            fg=MUTED,
+            font="TkTextFont",
+            padx=0,
+            pady=0,
+            cursor="xterm",
+        )
+        self.url_placeholder.bind("<Button-1>", lambda _e: self.url_entry.focus_set())
+        self.url_var.trace_add("write", lambda *_: self._update_url_placeholder())
+        self._update_url_placeholder()
         self.load_btn = ttk.Button(url_panel, text="Load", style="Accent.TButton", command=self.load_movie)
         self.load_btn.pack(side="right")
 
@@ -847,18 +1244,14 @@ class JumpScareApp(tk.Tk):
         # Only shown for TV shows: lets the user pick which season/episode's
         # jumpscares the timer should track. Hidden entirely for movies.
         self.episode_frame = ttk.Frame(movie_info, style="Panel.TFrame")
-        ttk.Label(self.episode_frame, text="Episode", style="PanelMuted.TLabel").pack(
-            side="left", padx=(0, 8)
+        ttk.Label(self.episode_frame, text="EPISODE", style="SettingTag.TLabel").pack(
+            side="left", padx=(0, 10)
         )
-        self.episode_var = tk.StringVar()
-        self.episode_combo = ttk.Combobox(
+        self.episode_dropdown = DarkDropdown(
             self.episode_frame,
-            textvariable=self.episode_var,
-            state="readonly",
-            width=46,
+            command=lambda value: self.select_episode(*value),
         )
-        self.episode_combo.pack(side="left")
-        self.episode_combo.bind("<<ComboboxSelected>>", self.on_episode_selected)
+        self.episode_dropdown.pack(side="left")
 
         ttk.Label(movie_info, textvariable=self.next_var, style="Panel.TLabel",
                   font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(18, 2))
@@ -880,7 +1273,7 @@ class JumpScareApp(tk.Tk):
         self.canvas.pack(fill="x", expand=True)
         self.canvas.bind("<Button-1>", self.on_timeline_click)
         self.canvas.bind("<Motion>", self.on_timeline_hover)
-        self.canvas.bind("<Leave>", lambda _e: self.status_var.set("Click the timeline to seek."))
+        self.canvas.bind("<Leave>", self.on_timeline_leave)
         self.canvas.bind("<Configure>", lambda _e: self.draw_timeline())
 
         controls = ttk.Frame(self.main)
@@ -1116,11 +1509,27 @@ class JumpScareApp(tk.Tk):
         level = self.ramp_start_volume + (self.ramp_target_volume - self.ramp_start_volume) * fraction
         self._set_volume(level)
 
+    def _update_url_placeholder(self):
+        if self.url_var.get():
+            self.url_placeholder.place_forget()
+        else:
+            self.url_placeholder.place(x=11, rely=0.5, anchor="w")
+
+    def _on_url_enter(self, _event=None):
+        if not self.load_btn.instate(["disabled"]):  # ignore while a load is running
+            # Drop focus like the settings entries do, signalling the URL was
+            # submitted. An empty URL keeps focus so the user can type one.
+            if self.url_var.get().strip():
+                self.focus_set()
+            self.load_movie()
+        return "break"
+
     def load_movie(self):
         self.commit_warning_seconds()
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showerror("Missing URL", "Enter a NotScare movie or TV show URL.")
+            self.status_var.set("Paste a notscare.me movie or TV show URL above, then press Enter or Load.")
+            self.url_entry.focus_set()
             return
 
         self.load_btn.config(state="disabled")
@@ -1142,7 +1551,7 @@ class JumpScareApp(tk.Tk):
         if result["kind"] == "series":
             self.series_mode = True
             self.series_data = result
-            self._populate_episode_combo()
+            self._populate_episode_dropdown()
             self.episode_frame.pack(anchor="w", pady=(18, 2))
 
             first = next(
@@ -1163,37 +1572,28 @@ class JumpScareApp(tk.Tk):
             self.episode_frame.pack_forget()
             self._apply_episode(result["title"], result["runtime"], result["scares"])
 
-    def _populate_episode_combo(self):
-        self.episode_lookup = []
-        labels = []
+    def _populate_episode_dropdown(self):
+        entries = []
         for season in self.series_data["seasons"]:
+            if not season["episodes"]:
+                continue
+            entries.append({"header": f"Season {season['season']}"})
             for ep in season["episodes"]:
-                self.episode_lookup.append((season["season"], ep["episode"]))
-                labels.append(
-                    f"S{season['season']:02d}E{ep['episode']:02d} - {ep['title']} "
-                    f"({len(ep['scares'])} scares)"
-                )
-        self.episode_combo.config(values=labels)
-
-    def on_episode_selected(self, _event=None):
-        index = self.episode_combo.current()
-        if 0 <= index < len(self.episode_lookup):
-            self.select_episode(*self.episode_lookup[index])
-
-    def _close_episode_dropdown(self):
-        try:
-            self.tk.call("ttk::combobox::Unpost", str(self.episode_combo))
-        except tk.TclError:
-            pass
+                count = len(ep["scares"])
+                entries.append({
+                    "value": (season["season"], ep["episode"]),
+                    "tag": f"S{season['season']:02d}E{ep['episode']:02d}",
+                    "list_tag": f"E{ep['episode']:02d}",
+                    "text": ep["title"],
+                    "detail": f"{count} scare{'' if count == 1 else 's'}",
+                })
+        self.episode_dropdown.set_entries(entries)
 
     def select_episode(self, season_number, episode_number):
         season = next(s for s in self.series_data["seasons"] if s["season"] == season_number)
         episode = next(e for e in season["episodes"] if e["episode"] == episode_number)
 
-        self.episode_var.set(
-            f"S{season_number:02d}E{episode_number:02d} - {episode['title']} "
-            f"({len(episode['scares'])} scares)"
-        )
+        self.episode_dropdown.select((season_number, episode_number))
         title = f"{self.series_data['title']} — S{season_number:02d}E{episode_number:02d} · {episode['title']}"
         self._apply_episode(title, episode["runtime"], episode["scares"])
 
@@ -1542,19 +1942,64 @@ class JumpScareApp(tk.Tk):
             width=2,
         )
 
-    def on_timeline_click(self, event):
-        if not self.scares:
-            return
+        self._draw_timeline_hover()
+
+    def _timeline_x_to_seconds(self, x):
+        """Clamp a canvas x onto the track and return (clamped x, seconds)."""
         width = max(220, self.canvas.winfo_width())
         left = self.timeline_left
         right = width - self.timeline_right
-        x = min(max(event.x, left), right)
+        x = min(max(x, left), right)
         ratio = (x - left) / max(1, right - left)
-        self.seek_to(ratio * self.duration)
+        return x, ratio * self.duration
+
+    def _draw_timeline_hover(self):
+        """Draw a thin seek guide with a time readout under the mouse."""
+        self.canvas.delete("hover")
+        if self.timeline_hover_x is None or self.duration <= 0:
+            return
+
+        x, seconds = self._timeline_x_to_seconds(self.timeline_hover_x)
+        y = self.timeline_y
+        self.canvas.create_line(x, y - 30, x, y + 12, fill=TEXT, width=1, tags="hover")
+
+        text_id = self.canvas.create_text(
+            x, y - 44,
+            text=seconds_to_hms(seconds),
+            font=("Consolas", 9, "bold"),
+            fill=TEXT,
+            tags="hover",
+        )
+        # Keep the readout pill inside the canvas near either end of the track.
+        x0, y0, x1, y1 = self.canvas.bbox(text_id)
+        pad_x, pad_y = 7, 3
+        shift = max(0, 2 - (x0 - pad_x)) - max(0, (x1 + pad_x) - (self.canvas.winfo_width() - 2))
+        self.canvas.move(text_id, shift, 0)
+        pill = self.canvas.create_rectangle(
+            x0 - pad_x + shift, y0 - pad_y, x1 + pad_x + shift, y1 + pad_y,
+            fill=BG,
+            outline=ACCENT,
+            tags="hover",
+        )
+        self.canvas.tag_lower(pill, text_id)
+
+    def on_timeline_click(self, event):
+        if not self.scares:
+            return
+        _x, seconds = self._timeline_x_to_seconds(event.x)
+        self.seek_to(seconds)
+
+    def on_timeline_leave(self, _event=None):
+        self.timeline_hover_x = None
+        self.canvas.delete("hover")
+        self.status_var.set("Click the timeline to seek.")
 
     def on_timeline_hover(self, event):
         if not self.scares:
             return
+
+        self.timeline_hover_x = event.x
+        self._draw_timeline_hover()
 
         nearest = None
         nearest_distance = 12
@@ -1569,14 +2014,8 @@ class JumpScareApp(tk.Tk):
             desc = scare["description"] or "No description"
             self.status_var.set(f"{scare['timestamp']}  •  {scare['severity']}  •  {desc}")
         else:
-            width = max(220, self.canvas.winfo_width())
-            left = self.timeline_left
-            right = width - self.timeline_right
-            x = min(max(event.x, left), right)
-            ratio = (x - left) / max(1, right - left)
-            self.status_var.set(
-                f"Seek to {seconds_to_hms(ratio * self.duration)} — click to jump."
-            )
+            _x, seconds = self._timeline_x_to_seconds(event.x)
+            self.status_var.set(f"Seek to {seconds_to_hms(seconds)} — click to jump.")
 
 
 if __name__ == "__main__":
