@@ -1,5 +1,6 @@
 import ctypes
 import io
+import json
 import os
 import re
 import sys
@@ -89,12 +90,54 @@ def seconds_to_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+MISSING_DEPS_MESSAGE = (
+    "Missing dependencies. Run:\n\n"
+    "    py -m pip install requests beautifulsoup4 pillow"
+)
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/152 Safari/537.36"
+    )
+}
+
+
+def _check_notscare_host(url: str):
+    parsed = urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+    if host != "notscare.me" and not host.endswith(".notscare.me"):
+        raise ValueError("Please enter a notscare.me movie or TV show URL.")
+    return parsed
+
+
 def scrape_notscare(url: str):
+    """Scrape a notscare.me URL, dispatching to the movie or TV-show parser
+    based on the URL path (/movies/... vs /series/...)."""
     if requests is None or BeautifulSoup is None:
-        raise RuntimeError(
-            "Missing dependencies. Run:\n\n"
-            "    py -m pip install requests beautifulsoup4 pillow"
-        )
+        raise RuntimeError(MISSING_DEPS_MESSAGE)
+
+    parsed = _check_notscare_host(url)
+    path = parsed.path or ""
+
+    if path.startswith("/series/"):
+        data = scrape_notscare_series(url, parsed)
+        data["kind"] = "series"
+        return data
+
+    if path.startswith("/movies/"):
+        data = scrape_notscare_movie(url)
+        data["kind"] = "movie"
+        return data
+
+    raise ValueError(
+        "Please enter a notscare.me movie URL (/movies/...) or TV show URL (/series/...)."
+    )
+
+
+def scrape_notscare_movie(url: str):
+    if requests is None or BeautifulSoup is None:
+        raise RuntimeError(MISSING_DEPS_MESSAGE)
 
     parsed = urlparse(url.strip())
     host = (parsed.hostname or "").lower()
@@ -222,6 +265,147 @@ def scrape_notscare(url: str):
         "scares": scares,
         "poster_url": poster_url,
         "poster_bytes": poster_bytes,
+    }
+
+
+_NEXT_PUSH_RE = re.compile(r"self\.__next_f\.push\(\[1,")
+_NEXT_SEGMENT_RE = re.compile(r"\n(?=\d+:)")
+
+
+def _extract_next_data_nodes(html):
+    """notscare.me (a Next.js app) streams its page data as JSON inside
+    `self.__next_f.push([1, "N:<json>"])` script calls. The rendered text
+    we used to scrape only shows what's expanded in the UI (e.g. a "Show
+    N More" accordion hides extra jumpscares), but this embedded JSON has
+    the complete, structured data, so we parse it directly instead."""
+    decoder = json.JSONDecoder()
+    nodes = []
+    for match in _NEXT_PUSH_RE.finditer(html):
+        try:
+            chunk, _end = decoder.raw_decode(html, match.end())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        for segment in _NEXT_SEGMENT_RE.split(chunk):
+            _seg_id, sep, payload = segment.partition(":")
+            if not sep:
+                continue
+            try:
+                nodes.append(json.loads(payload))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return nodes
+
+
+def _find_dicts(nodes, predicate):
+    """Recursively collect every dict in the parsed Next.js data tree that
+    matches predicate (e.g. "has a jumpscares list")."""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if predicate(node):
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for node in nodes:
+        walk(node)
+    return found
+
+
+def scrape_notscare_series(url: str, parsed=None):
+    if requests is None or BeautifulSoup is None:
+        raise RuntimeError(MISSING_DEPS_MESSAGE)
+
+    parsed = parsed or _check_notscare_host(url)
+    slug_match = re.match(r"^/series/([^/]+)", parsed.path or "")
+    if not slug_match:
+        raise ValueError("Please enter a notscare.me TV show URL.")
+    slug = slug_match.group(1)
+
+    season_url = f"https://{parsed.hostname}/series/{slug}/season/1"
+    response = requests.get(season_url, headers=REQUEST_HEADERS, timeout=15)
+    response.raise_for_status()
+
+    nodes = _extract_next_data_nodes(response.text)
+
+    shows = _find_dicts(nodes, lambda d: "numberOfSeasons" in d and "title" in d)
+    title = shows[0]["title"] if shows else "NotScare Series"
+    poster_url = shows[0].get("posterurl") if shows else None
+
+    season_numbers = {
+        season["id"]: season["seasonNumber"]
+        for season in _find_dicts(nodes, lambda d: "seasonNumber" in d and "id" in d)
+    }
+
+    episode_dicts = _find_dicts(
+        nodes, lambda d: "episodeNumber" in d and "jumpscares" in d
+    )
+
+    seasons_map = {}
+    for ep in episode_dicts:
+        season_number = season_numbers.get(ep.get("seasonId"), 1)
+
+        scares = []
+        for scare in ep["jumpscares"]:
+            sec = int(scare["timestamp"])
+            desc = re.sub(r"\s+", " ", (scare.get("description") or "")).strip()
+            if len(desc) > 190:
+                desc = desc[:187] + "..."
+            scares.append(
+                {
+                    "time": sec,
+                    "timestamp": seconds_to_hms(sec),
+                    "severity": (scare.get("type") or "Minor").title(),
+                    "description": desc,
+                }
+            )
+        scares.sort(key=lambda x: x["time"])
+
+        runtime = int(ep.get("runtime") or 0) * 60
+        if runtime <= 0:
+            runtime = max(DEFAULT_RUNTIME, scares[-1]["time"] + 60) if scares else DEFAULT_RUNTIME
+
+        episode = {
+            "episode": ep["episodeNumber"],
+            "title": (ep.get("name") or f"Episode {ep['episodeNumber']}").strip(),
+            "runtime": runtime,
+            "scares": scares,
+        }
+        # The same episode can appear in more than one streamed JSON chunk;
+        # keep a single entry per (season, episode) pair.
+        seasons_map.setdefault(season_number, {})[episode["episode"]] = episode
+
+    seasons = [
+        {
+            "season": season_number,
+            "episodes": sorted(episodes.values(), key=lambda e: e["episode"]),
+        }
+        for season_number, episodes in sorted(seasons_map.items())
+    ]
+
+    if not any(season["episodes"] for season in seasons):
+        raise RuntimeError(
+            "No episodes were found. The site's page structure may have changed."
+        )
+
+    poster_bytes = None
+    if poster_url:
+        try:
+            poster_response = requests.get(poster_url, headers=REQUEST_HEADERS, timeout=15)
+            poster_response.raise_for_status()
+            poster_bytes = poster_response.content
+        except requests.RequestException:
+            poster_bytes = None
+
+    return {
+        "title": title,
+        "poster_url": poster_url,
+        "poster_bytes": poster_bytes,
+        "seasons": seasons,
     }
 
 
@@ -375,6 +559,10 @@ class JumpScareApp(tk.Tk):
         self.warning_overlay_dismissed = False
         self.poster_photo = None
 
+        self.series_mode = False
+        self.series_data = None
+        self.episode_lookup = []  # combobox index -> (season, episode)
+
         self.duck_percent = DEFAULT_DUCK_PERCENT
         self.restore_seconds = DEFAULT_RESTORE_SECONDS
         self.volume_ducked = False
@@ -401,12 +589,16 @@ class JumpScareApp(tk.Tk):
         self.duck_percent_var = tk.StringVar(value=str(DEFAULT_DUCK_PERCENT))
         self.restore_seconds_var = tk.StringVar(value=str(DEFAULT_RESTORE_SECONDS))
         self.time_var = tk.StringVar(value="00:00:00 / 02:00:00")
-        self.status_var = tk.StringVar(value="Paste a NotScare movie URL and load it.")
+        self.status_var = tk.StringVar(value="Paste a NotScare movie or TV show URL and load it.")
         self.next_var = tk.StringVar(value="Next scare  —")
 
         self._setup_style()
         self._build_ui()
         self.bind("<Escape>", lambda _e: self.dismiss_warning_overlay())
+        # Windows doesn't always close an open ttk Combobox dropdown when the
+        # user alt-tabs or clicks another application; force it shut so it
+        # can't stay on top of other windows.
+        self.bind("<Deactivate>", lambda _e: self._close_episode_dropdown())
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(TICK_MS, self._tick)
 
@@ -614,7 +806,7 @@ class JumpScareApp(tk.Tk):
 
         self.url_entry = ttk.Entry(url_panel, textvariable=self.url_var)
         self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.load_btn = ttk.Button(url_panel, text="Load movie", style="Accent.TButton", command=self.load_movie)
+        self.load_btn = ttk.Button(url_panel, text="Load", style="Accent.TButton", command=self.load_movie)
         self.load_btn.pack(side="right")
 
         hero = ttk.Frame(self.main, style="Panel.TFrame", padding=14)
@@ -651,6 +843,22 @@ class JumpScareApp(tk.Tk):
             font=("Segoe UI", 10),
         )
         self.movie_meta.pack(anchor="w")
+
+        # Only shown for TV shows: lets the user pick which season/episode's
+        # jumpscares the timer should track. Hidden entirely for movies.
+        self.episode_frame = ttk.Frame(movie_info, style="Panel.TFrame")
+        ttk.Label(self.episode_frame, text="Episode", style="PanelMuted.TLabel").pack(
+            side="left", padx=(0, 8)
+        )
+        self.episode_var = tk.StringVar()
+        self.episode_combo = ttk.Combobox(
+            self.episode_frame,
+            textvariable=self.episode_var,
+            state="readonly",
+            width=46,
+        )
+        self.episode_combo.pack(side="left")
+        self.episode_combo.bind("<<ComboboxSelected>>", self.on_episode_selected)
 
         ttk.Label(movie_info, textvariable=self.next_var, style="Panel.TLabel",
                   font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(18, 2))
@@ -912,11 +1120,11 @@ class JumpScareApp(tk.Tk):
         self.commit_warning_seconds()
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showerror("Missing URL", "Enter a NotScare movie URL.")
+            messagebox.showerror("Missing URL", "Enter a NotScare movie or TV show URL.")
             return
 
         self.load_btn.config(state="disabled")
-        self.status_var.set("Loading movie, poster, and jump-scare data...")
+        self.status_var.set("Loading poster and jump-scare data...")
 
         def worker():
             try:
@@ -928,9 +1136,73 @@ class JumpScareApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def finish_loading(self, result):
-        self.movie_title = result["title"]
-        self.duration = result["runtime"]
-        self.scares = result["scares"]
+        self.load_btn.config(state="normal")
+        self.set_poster(result.get("poster_bytes"))
+
+        if result["kind"] == "series":
+            self.series_mode = True
+            self.series_data = result
+            self._populate_episode_combo()
+            self.episode_frame.pack(anchor="w", pady=(18, 2))
+
+            first = next(
+                (
+                    (season["season"], ep["episode"])
+                    for season in result["seasons"]
+                    for ep in season["episodes"]
+                ),
+                None,
+            )
+            if first is None:
+                self.status_var.set("Loaded series but found no episodes.")
+                return
+            self.select_episode(*first)
+        else:
+            self.series_mode = False
+            self.series_data = None
+            self.episode_frame.pack_forget()
+            self._apply_episode(result["title"], result["runtime"], result["scares"])
+
+    def _populate_episode_combo(self):
+        self.episode_lookup = []
+        labels = []
+        for season in self.series_data["seasons"]:
+            for ep in season["episodes"]:
+                self.episode_lookup.append((season["season"], ep["episode"]))
+                labels.append(
+                    f"S{season['season']:02d}E{ep['episode']:02d} - {ep['title']} "
+                    f"({len(ep['scares'])} scares)"
+                )
+        self.episode_combo.config(values=labels)
+
+    def on_episode_selected(self, _event=None):
+        index = self.episode_combo.current()
+        if 0 <= index < len(self.episode_lookup):
+            self.select_episode(*self.episode_lookup[index])
+
+    def _close_episode_dropdown(self):
+        try:
+            self.tk.call("ttk::combobox::Unpost", str(self.episode_combo))
+        except tk.TclError:
+            pass
+
+    def select_episode(self, season_number, episode_number):
+        season = next(s for s in self.series_data["seasons"] if s["season"] == season_number)
+        episode = next(e for e in season["episodes"] if e["episode"] == episode_number)
+
+        self.episode_var.set(
+            f"S{season_number:02d}E{episode_number:02d} - {episode['title']} "
+            f"({len(episode['scares'])} scares)"
+        )
+        title = f"{self.series_data['title']} — S{season_number:02d}E{episode_number:02d} · {episode['title']}"
+        self._apply_episode(title, episode["runtime"], episode["scares"])
+
+    def _apply_episode(self, title, runtime, scares):
+        """Load one movie's or TV episode's title/runtime/scares and reset
+        playback state to the start, same as loading a fresh movie."""
+        self.movie_title = title
+        self.duration = runtime
+        self.scares = scares
         self.position = 0.0
         self.playing = False
         self.last_tick = None
@@ -948,11 +1220,10 @@ class JumpScareApp(tk.Tk):
         )
         self.set_play_button(False)
 
-        self.set_poster(result.get("poster_bytes"))
         self.refresh_tree()
-        self.load_btn.config(state="normal")
+        what = "episode" if self.series_mode else "movie"
         self.status_var.set(
-            f"Loaded {len(self.scares)} jump scares. Start this timer when the movie starts."
+            f"Loaded {len(self.scares)} jump scares. Start this timer when the {what} starts."
         )
         self.update_display()
         self.draw_timeline()
@@ -1018,8 +1289,8 @@ class JumpScareApp(tk.Tk):
             self.play_btn.config(text="▶  Start", image="", style="Play.TButton")
 
     def toggle_play(self):
-        if not self.scares:
-            messagebox.showinfo("Load a Movie", "Load a NotScare movie first.")
+        if not self.movie_title:
+            messagebox.showinfo("Load a Movie", "Load a NotScare movie or TV episode first.")
             return
 
         self.commit_warning_seconds()
