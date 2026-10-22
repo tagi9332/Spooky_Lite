@@ -38,7 +38,7 @@ DEFAULT_RUNTIME = 2 * 60 * 60
 DEFAULT_WARNING_SECONDS = 20
 MIN_WARNING_SECONDS = 1
 MAX_WARNING_SECONDS = 600
-DEFAULT_DUCK_PERCENT = 10
+DEFAULT_DUCK_PERCENT = 15
 DEFAULT_RESTORE_SECONDS = 10
 MAX_RESTORE_SECONDS = 600
 VOLUME_RESTORE_RAMP_SECONDS = 5.0
@@ -1170,7 +1170,7 @@ class JumpScareApp(tk.Tk):
         volume_line = setting_row(2, "VOLUME", [
             "Drop to",
             (self.duck_percent_var, self.commit_duck_percent),
-            "% until",
+            "% of current until",
             (self.restore_seconds_var, self.commit_restore_seconds),
             "seconds after",
         ])
@@ -1429,8 +1429,8 @@ class JumpScareApp(tk.Tk):
         if value is not None and value != self.duck_percent:
             self.duck_percent = value
             if self.volume_ducked:
-                self._set_volume(min(self.saved_volume, value / 100))
-            self.status_var.set(f"Volume drops to {value}% during warnings.")
+                self._set_volume(self.ducked_volume())
+            self.status_var.set(f"Volume drops to {value}% of its current level during warnings.")
         return "break"
 
     def commit_restore_seconds(self, _event=None):
@@ -1451,6 +1451,10 @@ class JumpScareApp(tk.Tk):
         except Exception as exc:
             self.status_var.set(f"Could not change system volume: {exc}")
             return False
+
+    def ducked_volume(self):
+        """Warning volume, scaled relative to the level saved before ducking."""
+        return self.saved_volume * self.duck_percent / 100
 
     def in_duck_window(self):
         return any(
@@ -1473,8 +1477,7 @@ class JumpScareApp(tk.Tk):
             except Exception as exc:
                 self.status_var.set(f"Could not read system volume: {exc}")
                 return
-            # Never raise the volume if it was already below the warning level.
-            if self._set_volume(min(self.saved_volume, self.duck_percent / 100)):
+            if self._set_volume(self.ducked_volume()):
                 self.volume_ducked = True
         else:
             self.restore_volume()
@@ -1486,7 +1489,7 @@ class JumpScareApp(tk.Tk):
         try:
             # If the user changed the volume by hand during the warning, keep their choice.
             current = self.volume.get()
-            if abs(current - min(self.saved_volume, self.duck_percent / 100)) < 0.01:
+            if abs(current - self.ducked_volume()) < 0.01:
                 self.ramp_active = True
                 self.ramp_start_time = time.monotonic()
                 self.ramp_start_volume = current
