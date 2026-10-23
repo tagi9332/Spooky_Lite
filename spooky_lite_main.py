@@ -1,12 +1,17 @@
 import ctypes
 import io
 import json
+import math
 import os
 import re
+import struct
+import subprocess
 import sys
+import tempfile
 import time
 import threading
 import uuid
+import wave
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 from urllib.parse import urlparse
@@ -73,6 +78,39 @@ MINOR = "#ffb454"
 SUCCESS = "#55d6a6"
 SUCCESS_HOVER = "#7fe3bd"
 TRACK = "#33405b"
+
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+
+# Segoe UI/Consolas only ship with Windows. macOS gets Helvetica Neue/Menlo,
+# scaled up because Tk on macOS renders 1pt as 1px (Windows: 96 dpi, 1pt = 1.33px).
+if IS_MAC:
+    _UI_FAMILIES = {"normal": "Helvetica Neue", "semibold": "Helvetica Neue", "black": "Helvetica Neue"}
+    _UI_WEIGHTS = {"normal": None, "semibold": "bold", "black": "bold"}
+    _MONO_FAMILY = "Menlo"
+    _FONT_SCALE = 4 / 3
+else:
+    _UI_FAMILIES = {"normal": "Segoe UI", "semibold": "Segoe UI Semibold", "black": "Segoe UI Black"}
+    _UI_WEIGHTS = {"normal": None, "semibold": None, "black": None}
+    _MONO_FAMILY = "Consolas"
+    _FONT_SCALE = 1
+
+
+def _font_size(size):
+    return size if _FONT_SCALE == 1 else round(size * _FONT_SCALE)
+
+
+def ui_font(size, weight="normal"):
+    """Tk font tuple for UI text; weight is "normal", "semibold" or "black"."""
+    family = _UI_FAMILIES[weight]
+    tk_weight = _UI_WEIGHTS[weight]
+    if tk_weight:
+        return (family, _font_size(size), tk_weight)
+    return (family, _font_size(size))
+
+
+def mono_font(size, *styles):
+    return (_MONO_FAMILY, _font_size(size), *styles)
 
 
 def hms_to_seconds(value: str) -> int:
@@ -537,6 +575,110 @@ class WindowsMasterVolume:
         )
 
 
+class MacMasterVolume:
+    """macOS output volume through AppleScript (osascript), no extra dependencies.
+
+    Each osascript call takes ~50-100 ms, so set() hands the level to a
+    background thread that always applies the newest value. That keeps the
+    restore ramp (one set() per tick) from stalling the Tk main loop.
+    """
+
+    def __init__(self):
+        if not IS_MAC:
+            raise OSError("MacMasterVolume only works on macOS.")
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._pending = None  # Level queued for the writer thread, not applied yet.
+        self._error = None  # Last writer failure, surfaced on the next set().
+        self.get()  # Fail early if the output device has no volume control (e.g. HDMI).
+        threading.Thread(target=self._writer, daemon=True).start()
+
+    @staticmethod
+    def _osascript(script):
+        result = subprocess.run(
+            ["osascript", "-e", script], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            raise OSError(result.stderr.strip() or "osascript failed")
+        return result.stdout.strip()
+
+    def get(self):
+        """Return the output volume as a 0.0-1.0 scalar."""
+        with self._lock:
+            if self._pending is not None:
+                return self._pending
+        out = self._osascript("output volume of (get volume settings)")
+        if out == "missing value":
+            raise OSError("The current output device has no volume control.")
+        return int(out) / 100
+
+    def set(self, level):
+        """Queue the output volume (0.0-1.0) for the writer thread."""
+        with self._lock:
+            error, self._error = self._error, None
+            self._pending = max(0.0, min(1.0, float(level)))
+        self._wake.set()
+        if error:
+            raise error
+
+    def _writer(self):
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            with self._lock:
+                level = self._pending
+            if level is None:
+                continue
+            try:
+                self._osascript(f"set volume output volume {round(level * 100)}")
+            except Exception as exc:
+                with self._lock:
+                    self._error = exc
+            with self._lock:
+                if self._pending == level:
+                    self._pending = None
+
+
+def create_master_volume():
+    """Return the system volume controller for this OS; raises if unsupported."""
+    if IS_MAC:
+        return MacMasterVolume()
+    return WindowsMasterVolume()
+
+
+_chime_wav_paths = {}
+
+
+def chime_wav_path(sequence):
+    """Render a chime note sequence to a WAV file in the temp dir and return its
+    path. Used on macOS, which has no winsound.Beep; written once per run."""
+    key = tuple(sequence)
+    if key in _chime_wav_paths:
+        return _chime_wav_paths[key]
+
+    rate = 44100
+    frames = bytearray()
+    gap = b"\x00\x00" * int(rate * CHIME_NOTE_GAP)
+    for freq, duration in sequence:
+        count = int(rate * duration / 1000)
+        fade = max(1, min(count // 4, int(rate * 0.01)))  # 10 ms in/out avoids clicks
+        for i in range(count):
+            envelope = min(1.0, i / fade, (count - i) / fade)
+            sample = 0.35 * envelope * math.sin(2 * math.pi * freq * i / rate)
+            frames += struct.pack("<h", int(sample * 32767))
+        frames += gap
+
+    name = "spookylite_chime_major.wav" if len(key) > len(CHIME_MINOR) else "spookylite_chime_minor.wav"
+    path = os.path.join(tempfile.gettempdir(), name)
+    with wave.open(path, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(bytes(frames))
+    _chime_wav_paths[key] = path
+    return path
+
+
 def app_is_foreground(widget):
     """Return True while one of this process's windows is the active window.
 
@@ -645,10 +787,10 @@ class DarkDropdown(tk.Frame):
         self._hover = None
         self._watch_job = None
 
-        self._tag_font = tkfont.Font(family="Segoe UI Semibold", size=10)
-        self._text_font = tkfont.Font(family="Segoe UI", size=10)
-        self._detail_font = tkfont.Font(family="Segoe UI", size=9)
-        self._header_font = tkfont.Font(family="Segoe UI Semibold", size=8)
+        self._tag_font = tkfont.Font(font=ui_font(10, "semibold"))
+        self._text_font = tkfont.Font(font=ui_font(10))
+        self._detail_font = tkfont.Font(font=ui_font(9))
+        self._header_font = tkfont.Font(font=ui_font(8, "semibold"))
 
         self._tag_label = tk.Label(self, bg=BG, fg=ACCENT, font=self._tag_font)
         self._chevron = tk.Label(self, text="▾", bg=BG, fg=MUTED, font=self._text_font)
@@ -891,7 +1033,12 @@ class DarkDropdown(tk.Frame):
     def _on_wheel(self, event):
         if self._canvas is None:
             return None
-        self._canvas.yview_scroll(int(-event.delta / 120 * 40), "units")
+        if IS_MAC and abs(event.delta) < 120:
+            # Tk 8.6 on macOS reports small raw steps (about ±1 per notch), not ±120.
+            pixels = -event.delta * 8
+        else:
+            pixels = int(-event.delta / 120 * 40)
+        self._canvas.yview_scroll(pixels, "units")
         return "break"
 
     def _on_global_click(self, event):
@@ -952,7 +1099,7 @@ class JumpScareApp(tk.Tk):
         self.ramp_start_volume = 0.0
         self.ramp_target_volume = 0.0
         try:
-            self.volume = WindowsMasterVolume()
+            self.volume = create_master_volume()
         except Exception:
             self.volume = None
 
@@ -992,12 +1139,12 @@ class JumpScareApp(tk.Tk):
         style.configure("TFrame", background=BG)
         style.configure("Panel.TFrame", background=PANEL)
         style.configure("Panel2.TFrame", background=PANEL_2)
-        style.configure("TLabel", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        style.configure("TLabel", background=BG, foreground=TEXT, font=ui_font(10))
         style.configure("Muted.TLabel", background=BG, foreground=MUTED)
         style.configure("Panel.TLabel", background=PANEL, foreground=TEXT)
         style.configure("PanelMuted.TLabel", background=PANEL, foreground=MUTED)
-        style.configure("Title.TLabel", background=BG, foreground=TEXT, font=("Segoe UI Semibold", 21))
-        style.configure("Clock.TLabel", background=BG, foreground=ACCENT, font=("Consolas", 15, "bold"))
+        style.configure("Title.TLabel", background=BG, foreground=TEXT, font=ui_font(21, "semibold"))
+        style.configure("Clock.TLabel", background=BG, foreground=ACCENT, font=mono_font(15, "bold"))
 
         style.configure(
             "TButton",
@@ -1006,7 +1153,7 @@ class JumpScareApp(tk.Tk):
             borderwidth=0,
             focusthickness=0,
             padding=(14, 9),
-            font=("Segoe UI Semibold", 10),
+            font=ui_font(10, "semibold"),
         )
         style.map("TButton", background=[("active", BORDER), ("pressed", ACCENT)])
 
@@ -1015,7 +1162,7 @@ class JumpScareApp(tk.Tk):
             background=ACCENT,
             foreground="#071120",
             padding=(16, 9),
-            font=("Segoe UI Semibold", 10),
+            font=ui_font(10, "semibold"),
         )
         style.map("Accent.TButton", background=[("active", ACCENT_HOVER)])
 
@@ -1025,7 +1172,7 @@ class JumpScareApp(tk.Tk):
             background=SUCCESS,
             foreground="#06130e",
             padding=(16, 9),
-            font=("Segoe UI Semibold", 10),
+            font=ui_font(10, "semibold"),
         )
         style.map("Play.TButton", background=[("active", SUCCESS_HOVER)])
         style.configure(
@@ -1033,7 +1180,7 @@ class JumpScareApp(tk.Tk):
             background=ACCENT,
             foreground=TEXT,
             padding=(16, 9),
-            font=("Segoe UI Semibold", 10),
+            font=ui_font(10, "semibold"),
         )
         style.map("Pause.TButton", background=[("active", ACCENT_HOVER)])
 
@@ -1041,7 +1188,7 @@ class JumpScareApp(tk.Tk):
             "SettingTag.TLabel",
             background=PANEL,
             foreground=ACCENT,
-            font=("Segoe UI Semibold", 8),
+            font=ui_font(8, "semibold"),
         )
 
         style.configure(
@@ -1051,14 +1198,14 @@ class JumpScareApp(tk.Tk):
             foreground=TEXT,
             rowheight=30,
             borderwidth=0,
-            font=("Segoe UI", 9),
+            font=ui_font(9),
         )
         style.configure(
             "Treeview.Heading",
             background=PANEL_2,
             foreground=MUTED,
             relief="flat",
-            font=("Segoe UI Semibold", 9),
+            font=ui_font(9, "semibold"),
         )
         style.map("Treeview", background=[("selected", "#24456f")])
         style.map("Treeview.Heading", background=[("active", BORDER)])
@@ -1090,12 +1237,12 @@ class JumpScareApp(tk.Tk):
         """Set the window/taskbar icon to the cartoon ghost in assets/.
         Best-effort: missing assets or an unsupported platform just falls
         back to Tk's default icon instead of crashing the app."""
-        ico_path = resource_path("assets", "icon.ico")
-        try:
-            self.iconbitmap(ico_path)
-            return
-        except Exception:
-            pass
+        if IS_WINDOWS:
+            try:
+                self.iconbitmap(resource_path("assets", "icon.ico"))
+                return
+            except Exception:
+                pass
         png_path = resource_path("assets", "icon.png")
         if Image is not None and ImageTk is not None:
             try:
@@ -1114,7 +1261,7 @@ class JumpScareApp(tk.Tk):
         brand = ttk.Frame(top)
         brand.pack(side="left", fill="x", expand=True)
         ttk.Label(brand, text="Spooky Lite - NOTSCARE COMPANION", foreground=ACCENT,
-                  font=("Segoe UI Semibold", 10)).pack(anchor="w")
+                  font=ui_font(10, "semibold")).pack(anchor="w")
         ttk.Label(brand, text="Jump-scare warning timer", style="Title.TLabel").pack(anchor="w")
 
         # Settings card: a bordered panel with one labelled row per setting group.
@@ -1130,7 +1277,7 @@ class JumpScareApp(tk.Tk):
                 textvariable=var,
                 width=4,
                 justify="center",
-                font=("Segoe UI Semibold", 10),
+                font=ui_font(10, "semibold"),
             )
 
             def on_enter(event):
@@ -1218,7 +1365,7 @@ class JumpScareApp(tk.Tk):
             text="POSTER",
             bg=PANEL_2,
             fg=MUTED,
-            font=("Segoe UI Semibold", 10),
+            font=ui_font(10, "semibold"),
         )
         self.poster_label.pack(fill="both", expand=True)
 
@@ -1229,7 +1376,7 @@ class JumpScareApp(tk.Tk):
             movie_info,
             text="No movie loaded",
             style="Panel.TLabel",
-            font=("Segoe UI Semibold", 22),
+            font=ui_font(22, "semibold"),
         )
         self.movie_label.pack(anchor="w", pady=(6, 2))
 
@@ -1237,7 +1384,7 @@ class JumpScareApp(tk.Tk):
             movie_info,
             text="Load a NotScare page to populate the timeline.",
             style="PanelMuted.TLabel",
-            font=("Segoe UI", 10),
+            font=ui_font(10),
         )
         self.movie_meta.pack(anchor="w")
 
@@ -1254,14 +1401,14 @@ class JumpScareApp(tk.Tk):
         self.episode_dropdown.pack(side="left")
 
         ttk.Label(movie_info, textvariable=self.next_var, style="Panel.TLabel",
-                  font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(18, 2))
+                  font=ui_font(12, "semibold")).pack(anchor="w", pady=(18, 2))
         ttk.Label(movie_info, textvariable=self.time_var, background=PANEL, foreground=ACCENT,
-                  font=("Consolas", 18, "bold")).pack(anchor="w")
+                  font=mono_font(18, "bold")).pack(anchor="w")
 
         timeline_panel = ttk.Frame(self.main, style="Panel.TFrame", padding=(12, 10))
         timeline_panel.pack(fill="x", pady=(0, 12))
         ttk.Label(timeline_panel, text="Timeline", style="Panel.TLabel",
-                  font=("Segoe UI Semibold", 11)).pack(anchor="w", padx=4)
+                  font=ui_font(11, "semibold")).pack(anchor="w", padx=4)
 
         self.canvas = tk.Canvas(
             timeline_panel,
@@ -1320,7 +1467,7 @@ class JumpScareApp(tk.Tk):
             text="JUMP SCARE IN",
             bg="#190b11",
             fg="#ffb6c1",
-            font=("Segoe UI Semibold", 28),
+            font=ui_font(28, "semibold"),
         )
         self.overlay_title.pack(pady=(85, 4))
 
@@ -1329,7 +1476,7 @@ class JumpScareApp(tk.Tk):
             text="30",
             bg="#190b11",
             fg="white",
-            font=("Segoe UI Black", 112),
+            font=ui_font(112, "black"),
         )
         self.overlay_countdown.pack()
 
@@ -1338,7 +1485,7 @@ class JumpScareApp(tk.Tk):
             text="SECONDS",
             bg="#190b0b",
             fg="#ffb6c1",
-            font=("Segoe UI Semibold", 20),
+            font=ui_font(20, "semibold"),
         )
         self.overlay_seconds_label.pack()
 
@@ -1347,7 +1494,7 @@ class JumpScareApp(tk.Tk):
             text="",
             bg="#190b0b",
             fg="white",
-            font=("Segoe UI", 15),
+            font=ui_font(15),
         )
         self.overlay_detail.pack(pady=(18, 4))
 
@@ -1356,27 +1503,38 @@ class JumpScareApp(tk.Tk):
             text="",
             bg="#190b0b",
             fg="#d8c3c3",
-            font=("Segoe UI", 11),
+            font=ui_font(11),
             wraplength=760,
             justify="center",
         )
         self.overlay_description.pack(pady=(0, 26))
 
-        tk.Button(
-            self.overlay,
+        dismiss_style = dict(
             text="Dismiss  (Esc)",
-            command=self.dismiss_warning_overlay,
             bg="#342020",
             fg="white",
-            activebackground="#4a2a36",
-            activeforeground="white",
-            relief="flat",
-            bd=0,
             padx=22,
             pady=10,
-            font=("Segoe UI Semibold", 11),
+            font=ui_font(11, "semibold"),
             cursor="hand2",
-        ).pack()
+        )
+        if IS_MAC:
+            # Aqua draws tk.Button natively and ignores its colors, so fake it with a label.
+            dismiss = tk.Label(self.overlay, **dismiss_style)
+            dismiss.bind("<Button-1>", lambda _e: self.dismiss_warning_overlay())
+            dismiss.bind("<Enter>", lambda _e: dismiss.config(bg="#4a2a36"))
+            dismiss.bind("<Leave>", lambda _e: dismiss.config(bg="#342020"))
+        else:
+            dismiss = tk.Button(
+                self.overlay,
+                command=self.dismiss_warning_overlay,
+                activebackground="#4a2a36",
+                activeforeground="white",
+                relief="flat",
+                bd=0,
+                **dismiss_style,
+            )
+        dismiss.pack()
 
     def commit_warning_seconds(self, _event=None):
         raw = self.warning_seconds_var.get().strip()
@@ -1857,13 +2015,13 @@ class JumpScareApp(tk.Tk):
     def play_alert_sound(self, severity):
         """Play a cheerful chime instead of a harsh alarm."""
         try:
-            if sys.platform.startswith("win"):
+            sequence = CHIME_MAJOR if severity.lower() == "major" else CHIME_MINOR
+            chime_seconds = sum(d for _f, d in sequence) / 1000 + CHIME_NOTE_GAP * len(sequence)
+
+            if IS_WINDOWS:
                 import winsound
 
-                sequence = CHIME_MAJOR if severity.lower() == "major" else CHIME_MINOR
-
                 # The chime shares the master volume, so hold off ducking until it ends.
-                chime_seconds = sum(d for _f, d in sequence) / 1000 + CHIME_NOTE_GAP * len(sequence)
                 self.duck_hold_until = time.monotonic() + chime_seconds + 0.2
 
                 def beep():
@@ -1872,8 +2030,11 @@ class JumpScareApp(tk.Tk):
                         time.sleep(CHIME_NOTE_GAP)
 
                 threading.Thread(target=beep, daemon=True).start()
+            elif IS_MAC:
+                self.duck_hold_until = time.monotonic() + chime_seconds + 0.2
+                subprocess.Popen(["afplay", chime_wav_path(sequence)])
             else:
-                # Dependency-free fallback on non-Windows systems.
+                # Dependency-free fallback on other systems.
                 self.bell()
                 self.after(180, self.bell)
         except Exception:
@@ -1919,7 +2080,7 @@ class JumpScareApp(tk.Tk):
                 x, y + 18,
                 text=seconds_to_hms(tick),
                 anchor="n",
-                font=("Consolas", 8),
+                font=mono_font(8),
                 fill=MUTED,
             )
             tick += interval
@@ -1969,7 +2130,7 @@ class JumpScareApp(tk.Tk):
         text_id = self.canvas.create_text(
             x, y - 44,
             text=seconds_to_hms(seconds),
-            font=("Consolas", 9, "bold"),
+            font=mono_font(9, "bold"),
             fill=TEXT,
             tags="hover",
         )
